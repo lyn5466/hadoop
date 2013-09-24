@@ -1,0 +1,307 @@
+import java.io.IOException;
+import java.util.*;
+import java.io.InputStream;
+       
+import org.apache.hadoop.io.compress.*;
+import org.apache.commons.logging.Log; 
+import org.apache.commons.logging.LogFactory;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.FSDataInputStream;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.conf.*;
+import org.apache.hadoop.io.*;
+import org.apache.hadoop.mapred.*;
+import org.apache.hadoop.util.*;
+
+public class MySearchRecordReader extends RecordReader<LongWritable, Text> {
+private static final Log LOG = LogFactory.getLog(MySearchRecordReader.class);
+
+private CompressionCodecFactory compressionCodecs = null;
+private long start;
+private long pos;
+private long end;
+private LineReader in;
+private int maxLineLength;
+private LongWritable key = null;
+private Text value = null;
+//行分隔符，即一條記錄的分隔符
+private byte[] separator = {'\b'};
+private int sepLength = 1;
+
+public MySearchRecordReader(){}
+
+public MySearchRecordReader(String seps){
+this.separator = seps.getBytes();
+sepLength = separator.length;
+}
+
+public void initialize(InputSplit genericSplit, TaskAttemptContext context) throws IOException {
+FileSplit split = (FileSplit) genericSplit;
+Configuration job = context.getConfiguration();
+this.maxLineLength = job.getInt("mapred.linerecordreader.maxlength", Integer.MAX_VALUE);
+
+this.start = split.getStart();
+this.end = (this.start + split.getLength());
+Path file = split.getPath();
+this.compressionCodecs = new CompressionCodecFactory(job);
+CompressionCodec codec = this.compressionCodecs.getCodec(file);
+
+// open the file and seek to the start of the split
+FileSystem fs = file.getFileSystem(job);
+FSDataInputStream fileIn = fs.open(split.getPath());
+boolean skipFirstLine = false;
+if (codec != null) {
+this.in = new LineReader(codec.createInputStream(fileIn), job);
+this.end = Long.MAX_VALUE;
+} else {
+if (this.start != 0L) {
+skipFirstLine = true;
+this.start -= sepLength;
+fileIn.seek(this.start);
+}
+this.in = new LineReader(fileIn, job);
+}
+if (skipFirstLine) { // skip first line and re-establish "start".
+int newSize = in.readLine(new Text(), 0, (int) Math.min( (long) Integer.MAX_VALUE, end - start));
+
+if(newSize > 0){
+start += newSize;
+}
+}
+
+this.pos = this.start;
+}
+
+public boolean nextKeyValue() throws IOException {
+if (this.key == null) {
+this.key = new LongWritable();
+}
+this.key.set(this.pos);
+if (this.value == null) {
+this.value = new Text();
+}
+int newSize = 0;
+while (this.pos < this.end) {
+newSize = this.in.readLine(this.value, this.maxLineLength, Math.max(
+(int) Math.min(Integer.MAX_VALUE, this.end - this.pos), this.maxLineLength));
+
+if (newSize == 0) {
+break;
+}
+this.pos += newSize;
+if (newSize < this.maxLineLength) {
+break;
+}
+
+LOG.info("Skipped line of size " + newSize + " at pos " + (this.pos - newSize));
+}
+
+if (newSize == 0) {
+//讀下一個buffer
+this.key = null;
+this.value = null;
+return false;
+}
+//讀同一個buffer的下一個記錄
+return true;
+}
+
+public LongWritable getCurrentKey() {
+return this.key;
+}
+
+public Text getCurrentValue() {
+return this.value;
+}
+
+public float getProgress() {
+if (this.start == this.end) {
+return 0.0F;
+}
+return Math.min(1.0F, (float) (this.pos - this.start) / (float) (this.end - this.start));
+}
+
+public synchronized void close() throws IOException {
+if (this.in != null)
+this.in.close();
+}
+
+class LineReader {
+//回車鍵(hadoop默認)
+private static final byte CR = 13 ;
+//換行符(hadoop默認)
+private static final byte LF = 10 ;
+
+//按buffer進行文件讀取
+private static final int DEFAULT_BUFFER_SIZE = 32 * 1024 * 1024;
+private int bufferSize = DEFAULT_BUFFER_SIZE;
+private InputStream in;
+private byte[] buffer;
+private int bufferLength = 0;
+private int bufferPosn = 0;
+
+LineReader(InputStream in, int bufferSize) {
+this.bufferLength = 0;
+this.bufferPosn = 0;
+
+this.in = in;
+this.bufferSize = bufferSize;
+this.buffer = new byte[this.bufferSize];
+}
+
+public LineReader(InputStream in, Configuration conf) throws IOException {
+this(in, conf.getInt("io.file.buffer.size", DEFAULT_BUFFER_SIZE));
+}
+
+public void close() throws IOException {
+in.close();
+}
+
+public int readLine(Text str, int maxLineLength) throws IOException {
+return readLine(str, maxLineLength, Integer.MAX_VALUE);
+}
+
+public int readLine(Text str) throws IOException {
+return readLine(str, Integer.MAX_VALUE, Integer.MAX_VALUE);
+}
+
+// 以下是需要改寫的部分_start，核心代碼
+
+public int readLine(Text str, int maxLineLength, int maxBytesToConsume) throws IOException {
+str.clear();
+Text record = new Text();
+int txtLength = 0;
+long bytesConsumed = 0L;
+boolean newline = false;
+int sepPosn = 0;
+
+do {
+//已經讀到buffer的末尾了，讀下一個buffer
+if (this.bufferPosn >= this.bufferLength) {
+bufferPosn = 0;
+bufferLength = in.read(buffer);
+
+//讀到文件末尾了，則跳出，進行下一個文件的讀取
+if (bufferLength <= 0) {
+break;
+}
+}
+
+int startPosn = this.bufferPosn;
+for (; bufferPosn < bufferLength; bufferPosn ++) {
+//處理上一個buffer的尾巴被切成了兩半的分隔符(如果分隔符中重複字符過多在這裡會有問題)
+if(sepPosn > 0 && buffer[bufferPosn] != separator[sepPosn]){
+sepPosn = 0;
+}
+
+//遇到行分隔符的第一個字符
+if (buffer[bufferPosn] == separator[sepPosn]) {
+bufferPosn ++;
+int i = 0;
+
+//判斷接下來的字符是否也是行分隔符中的字符
+for(++ sepPosn; sepPosn < sepLength; i ++, sepPosn ++){
+
+//buffer的最後剛好是分隔符，且分隔符被不幸地切成了兩半
+if(bufferPosn + i >= bufferLength){
+bufferPosn += i - 1;
+break;
+}
+
+//一旦其中有一個字符不相同，就判定為不是分隔符
+if(this.buffer[this.bufferPosn + i] != separator[sepPosn]){
+sepPosn = 0;
+break;
+}
+}
+
+//的確遇到了行分隔符
+if(sepPosn == sepLength){
+bufferPosn += i;
+newline = true;
+sepPosn = 0;
+break;
+}
+}
+}
+
+int readLength = this.bufferPosn - startPosn;
+
+bytesConsumed += readLength;
+//行分隔符不放入塊中
+//int appendLength = readLength - newlineLength;
+if (readLength > maxLineLength - txtLength) {
+readLength = maxLineLength - txtLength;
+}
+if (readLength > 0) {
+record.append(this.buffer, startPosn, readLength);
+txtLength += readLength;
+
+//去掉記錄的分隔符
+if(newline){
+str.set(record.getBytes(), 0, record.getLength() - sepLength);
+}
+}
+
+} while (!newline && (bytesConsumed < maxBytesToConsume));
+
+if (bytesConsumed > (long)Integer.MAX_VALUE) {
+throw new IOException("Too many bytes before newline: " + bytesConsumed);
+}
+
+return (int) bytesConsumed;
+}
+
+// 以下是需要改寫的部分_end
+
+// 以下是hadoop-core中LineReader的源碼_start
+
+public int readLine(Text str, int maxLineLength, int maxBytesToConsume) throws IOException{
+str.clear();
+int txtLength = 0;
+int newlineLength = 0;
+boolean prevCharCR = false;
+long bytesConsumed = 0L;
+do {
+int startPosn = this.bufferPosn;
+if (this.bufferPosn >= this.bufferLength) {
+startPosn = this.bufferPosn = 0;
+if (prevCharCR) bytesConsumed ++;
+this.bufferLength = this.in.read(this.buffer);
+if (this.bufferLength <= 0) break;
+}
+for (; this.bufferPosn < this.bufferLength; this.bufferPosn ++) {
+if ( this.buffer[this.bufferPosn] == LF) {
+newlineLength = (prevCharCR) ? 2 : 1;
+this.bufferPosn ++;
+break;
+}
+if ( prevCharCR ) {
+newlineLength = 1;
+break;
+}
+prevCharCR = this.buffer[this.bufferPosn] == CR ;
+}
+int readLength = this.bufferPosn - startPosn;
+if ((prevCharCR) && (newlineLength == 0))
+--readLength;
+bytesConsumed += readLength;
+int appendLength = readLength - newlineLength;
+if (appendLength > maxLineLength - txtLength) {
+appendLength = maxLineLength - txtLength;
+}
+if (appendLength > 0) {
+str.append(this.buffer, startPosn, appendLength);
+txtLength += appendLength; }
+}
+while ((newlineLength == 0) && (bytesConsumed < maxBytesToConsume));
+
+if (bytesConsumed > (long)Integer.MAX_VALUE) throw new IOException("Too many bytes before newline: " + bytesConsumed);
+return (int)bytesConsumed;
+}
+
+// 以下是hadoop-core中LineReader的源碼_end
+
+} 
+
+} 
