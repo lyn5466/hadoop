@@ -49,6 +49,9 @@ public class Tweeter {
     conf.setMapperClass(Map.class);
     //conf.setCombinerClass(Reduce.class);
     conf.setReducerClass(Reduce.class);
+
+    conf.setNumMapTasks(Integer.valueOf(args[2]));
+    conf.setNumReduceTasks(Integer.valueOf(args[3]));
         
     conf.setInputFormat(ObjectPositionInputFormat.class);
     conf.setOutputFormat(TextOutputFormat.class);
